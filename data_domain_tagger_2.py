@@ -293,12 +293,12 @@ def parse_uploaded_data(uploaded_files) -> dict[str, pd.DataFrame]:
         if name.endswith((".xlsx", ".xls")):
             xls = pd.ExcelFile(uploaded_file, engine="openpyxl")
             for sheet_name in xls.sheet_names:
-                df = pd.read_excel(xls, sheet_name=sheet_name)
+                df = pd.read_excel(xls, sheet_name=sheet_name, nrows=100)
                 if not df.empty:
                     all_tables[sheet_name] = df
         elif name.endswith(".csv"):
             table_name = uploaded_file.name.rsplit(".", 1)[0]
-            df = pd.read_csv(uploaded_file)
+            df = pd.read_csv(uploaded_file, nrows=100)
             if not df.empty:
                 all_tables[table_name] = df
     return all_tables
@@ -335,7 +335,7 @@ def detect_value_pattern(values: list) -> str:
     if not str_vals:
         return "unknown"
 
-    sample = str_vals[:50]
+    sample = str_vals[:20]
 
     # Email
     email_matches = sum(1 for v in sample if re.match(r"^[\w.+-]+@[\w-]+\.[\w.]+$", v))
@@ -508,13 +508,13 @@ def build_table_text(table_name: str, df: pd.DataFrame) -> tuple[str, str, dict]
             col_analysis[col] = {
                 "quality": "meaningful",
                 "pattern": "—",           # not computed, not needed
-                "samples": detect_sample_values(df[col].dropna().head(10).tolist()),
+                "samples": detect_sample_values(df[col].dropna().head(20).tolist()),
             }
             text_parts.append(col)
 
         else:
             # ---- ANONYMOUS: sample values, detect pattern, use pattern ----
-            sample_vals = df[col].dropna().head(30).tolist()
+            sample_vals = df[col].dropna().head(20).tolist()
             pattern = detect_value_pattern(sample_vals)
             col_analysis[col] = {
                 "quality": "anonymous",
