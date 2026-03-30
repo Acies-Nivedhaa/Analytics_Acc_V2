@@ -190,6 +190,12 @@ def get_trino_connection(host, port, username, password, http_scheme, cluster_na
     return conn
 
 
+def trino_fetch_catalogs(conn) -> list[str]:
+    cur = conn.cursor()
+    cur.execute("SHOW CATALOGS")
+    return [r[0] for r in cur.fetchall()]
+
+
 def trino_fetch_schemas(conn, catalog: str) -> list[str]:
     cur = conn.cursor()
     cur.execute(f'SHOW SCHEMAS FROM "{catalog}"')
@@ -293,12 +299,12 @@ def parse_uploaded_data(uploaded_files) -> dict[str, pd.DataFrame]:
         if name.endswith((".xlsx", ".xls")):
             xls = pd.ExcelFile(uploaded_file, engine="openpyxl")
             for sheet_name in xls.sheet_names:
-                df = pd.read_excel(xls, sheet_name=sheet_name, nrows=20)
+                df = pd.read_excel(xls, sheet_name=sheet_name)
                 if not df.empty:
                     all_tables[sheet_name] = df
         elif name.endswith(".csv"):
             table_name = uploaded_file.name.rsplit(".", 1)[0]
-            df = pd.read_csv(uploaded_file, nrows=20)
+            df = pd.read_csv(uploaded_file)
             if not df.empty:
                 all_tables[table_name] = df
     return all_tables
@@ -335,7 +341,7 @@ def detect_value_pattern(values: list) -> str:
     if not str_vals:
         return "unknown"
 
-    sample = str_vals[:20]
+    sample = str_vals[:50]
 
     # Email
     email_matches = sum(1 for v in sample if re.match(r"^[\w.+-]+@[\w-]+\.[\w.]+$", v))
@@ -508,13 +514,13 @@ def build_table_text(table_name: str, df: pd.DataFrame) -> tuple[str, str, dict]
             col_analysis[col] = {
                 "quality": "meaningful",
                 "pattern": "—",           # not computed, not needed
-                "samples": detect_sample_values(df[col].dropna().head(20).tolist()),
+                "samples": detect_sample_values(df[col].dropna().head(10).tolist()),
             }
             text_parts.append(col)
 
         else:
             # ---- ANONYMOUS: sample values, detect pattern, use pattern ----
-            sample_vals = df[col].dropna().head(20).tolist()
+            sample_vals = df[col].dropna().head(30).tolist()
             pattern = detect_value_pattern(sample_vals)
             col_analysis[col] = {
                 "quality": "anonymous",
@@ -1094,7 +1100,7 @@ def main():
 
     # ── Tab B: Trino / DataOS ───────────────────────────────────────────────
     with tab_trino:
-        st.caption("**Connection**")
+        st.caption("**Credentials**")
 
         c1, c2 = st.columns([3, 1])
         with c1:
@@ -1109,106 +1115,170 @@ def main():
         with c3:
             trino_user = st.text_input("Username", placeholder="your-username")
         with c4:
-            trino_pass = st.text_input("Password / Token", type="password", placeholder="••••••••")
+            trino_pass = st.text_input("Password / API key", type="password", placeholder="••••••••")
 
         c5, c6 = st.columns(2)
         with c5:
             trino_scheme = st.selectbox("HTTP scheme", options=["https", "http"], index=0)
         with c6:
             trino_cluster = st.text_input(
-                "Cluster name (cluster-name header)",
+                "Cluster name",
                 value="minervac",
                 placeholder="minervac",
-                help="Passed as the 'cluster-name' HTTP header — leave blank if not needed.",
+                help="Passed as the 'cluster-name' HTTP header.",
             )
 
-        st.caption("**Schema**")
-        c7, c8 = st.columns(2)
-        with c7:
-            trino_catalog = st.text_input("Catalog", placeholder="icebase")
-        with c8:
-            trino_schema_input = st.text_input("Schema", placeholder="telemetry")
+        # ── Step 1: Connect ──
+        connect_col, _ = st.columns([1, 3])
+        with connect_col:
+            connect_btn = st.button("Connect", use_container_width=True)
 
-        # ── Connect & list tables ──
-        fetch_col, _ = st.columns([1, 3])
-        with fetch_col:
-            fetch_tables_btn = st.button("Fetch tables", use_container_width=True)
-
-        if fetch_tables_btn:
-            if not all([trino_host, trino_user, trino_pass, trino_catalog, trino_schema_input]):
-                st.error("Fill in host, username, password, catalog and schema first.")
+        if connect_btn:
+            if not all([trino_host, trino_user, trino_pass]):
+                st.error("Fill in host, username, and password.")
             else:
                 try:
-                    with st.spinner("Connecting to Trino..."):
+                    with st.spinner("Connecting…"):
                         conn = get_trino_connection(
                             trino_host, int(trino_port), trino_user, trino_pass,
                             trino_scheme, trino_cluster,
                         )
-                        table_list = trino_fetch_tables(conn, trino_catalog, trino_schema_input)
-                    st.session_state["trino_table_list"] = table_list
-                    st.session_state["trino_conn_params"] = {
+                        catalogs = trino_fetch_catalogs(conn)
+                    st.session_state["trino_connected"] = True
+                    st.session_state["trino_catalogs"] = catalogs
+                    st.session_state["trino_creds"] = {
                         "host": trino_host, "port": int(trino_port),
                         "user": trino_user, "pass": trino_pass,
                         "scheme": trino_scheme, "cluster": trino_cluster,
-                        "catalog": trino_catalog, "schema": trino_schema_input,
                     }
-                    st.success(f"Connected — {len(table_list)} tables found in `{trino_catalog}.{trino_schema_input}`")
+                    # Clear downstream state on reconnect
+                    for k in ["trino_schemas", "trino_table_list", "trino_loaded_tables",
+                              "trino_selected_catalog", "trino_selected_schema"]:
+                        st.session_state.pop(k, None)
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Connection failed: {e}")
-                    st.session_state.pop("trino_table_list", None)
+                    st.session_state.pop("trino_connected", None)
 
-        # ── Table multiselect ──
-        if "trino_table_list" in st.session_state:
-            table_list = st.session_state["trino_table_list"]
-            selected_tables = st.multiselect(
-                f"Select tables from `{st.session_state['trino_conn_params']['catalog']}.{st.session_state['trino_conn_params']['schema']}`",
-                options=table_list,
-                default=table_list[:min(5, len(table_list))],
-                help="Choose one or more tables to tag.",
-            )
+        # ── Step 2: Pick catalog ──
+        if st.session_state.get("trino_connected"):
+            catalogs = st.session_state.get("trino_catalogs", [])
+            if not catalogs:
+                st.warning("No catalogs found.")
+            else:
+                st.caption("**Catalog**")
+                selected_catalog = st.selectbox(
+                    "Catalog", options=catalogs,
+                    index=catalogs.index("icebase") if "icebase" in catalogs else 0,
+                    label_visibility="collapsed",
+                )
 
-            st.caption(
-                "ℹ️ **Smart loading:** column names are fetched in a single bulk query. "
-                "Row samples are only fetched for tables with anonymous column names."
-            )
-
-            sample_limit = st.slider(
-                "Sample rows (anonymous tables only)", min_value=20, max_value=200,
-                value=50, step=10,
-                help="Only applies to tables whose column names are generic (col1, c2, etc). Meaningful tables need zero rows.",
-            )
-
-            load_col, _ = st.columns([1, 3])
-            with load_col:
-                load_btn = st.button("Load selected tables", use_container_width=True, type="primary")
-
-            if load_btn:
-                if not selected_tables:
-                    st.warning("Select at least one table.")
-                else:
-                    p = st.session_state["trino_conn_params"]
-                    conn = get_trino_connection(
-                        p["host"], p["port"], p["user"], p["pass"],
-                        p["scheme"], p["cluster"],
-                    )
+                # Fetch schemas when catalog changes
+                if selected_catalog != st.session_state.get("trino_selected_catalog"):
+                    st.session_state["trino_selected_catalog"] = selected_catalog
+                    # Clear downstream
+                    for k in ["trino_schemas", "trino_table_list", "trino_loaded_tables",
+                              "trino_selected_schema"]:
+                        st.session_state.pop(k, None)
                     try:
-                        with st.spinner(f"Phase 1/2 — fetching column names for {len(selected_tables)} tables…"):
-                            loaded = trino_build_tables_smart(
-                                conn, p["catalog"], p["schema"], selected_tables, sample_limit
-                            )
-                        if loaded:
-                            meaningful_count = sum(1 for df in loaded.values() if len(df) == 0)
-                            anon_count = len(loaded) - meaningful_count
-                            st.session_state["trino_loaded_tables"] = loaded
-                            st.success(
-                                f"Loaded {len(loaded)} tables — "
-                                f"{meaningful_count} used column names only, "
-                                f"{anon_count} fetched row samples."
-                            )
-                        else:
-                            st.error("No tables loaded — check permissions or table names.")
+                        creds = st.session_state["trino_creds"]
+                        conn = get_trino_connection(
+                            creds["host"], creds["port"], creds["user"], creds["pass"],
+                            creds["scheme"], creds["cluster"],
+                        )
+                        with st.spinner(f"Fetching schemas from `{selected_catalog}`…"):
+                            schemas = trino_fetch_schemas(conn, selected_catalog)
+                        st.session_state["trino_schemas"] = schemas
                     except Exception as e:
-                        st.error(f"Load failed: {e}")
+                        st.error(f"Failed to fetch schemas: {e}")
+
+        # ── Step 3: Pick schema ──
+        if st.session_state.get("trino_schemas"):
+            schemas = st.session_state["trino_schemas"]
+            st.caption("**Schema**")
+            selected_schema = st.selectbox(
+                "Schema", options=schemas,
+                index=0,
+                label_visibility="collapsed",
+            )
+
+            # Fetch tables when schema changes
+            if selected_schema != st.session_state.get("trino_selected_schema"):
+                st.session_state["trino_selected_schema"] = selected_schema
+                st.session_state.pop("trino_table_list", None)
+                st.session_state.pop("trino_loaded_tables", None)
+                try:
+                    creds = st.session_state["trino_creds"]
+                    conn = get_trino_connection(
+                        creds["host"], creds["port"], creds["user"], creds["pass"],
+                        creds["scheme"], creds["cluster"],
+                    )
+                    catalog = st.session_state["trino_selected_catalog"]
+                    with st.spinner(f"Fetching tables from `{catalog}.{selected_schema}`…"):
+                        table_list = trino_fetch_tables(conn, catalog, selected_schema)
+                    st.session_state["trino_table_list"] = table_list
+                    st.session_state["trino_conn_params"] = {
+                        **creds,
+                        "catalog": catalog, "schema": selected_schema,
+                    }
+                except Exception as e:
+                    st.error(f"Failed to fetch tables: {e}")
+
+        # ── Step 4: Pick tables & load ──
+        if st.session_state.get("trino_table_list") is not None:
+            table_list = st.session_state["trino_table_list"]
+            catalog = st.session_state["trino_selected_catalog"]
+            schema = st.session_state["trino_selected_schema"]
+
+            if not table_list:
+                st.info(f"No tables found in `{catalog}.{schema}`.")
+            else:
+                st.caption(f"**Tables** — {len(table_list)} found in `{catalog}.{schema}`")
+                selected_tables = st.multiselect(
+                    "Select tables",
+                    options=table_list,
+                    default=table_list[:min(5, len(table_list))],
+                    label_visibility="collapsed",
+                    help="Choose one or more tables to tag.",
+                )
+
+                sample_limit = st.slider(
+                    "Sample rows (anonymous tables only)", min_value=20, max_value=200,
+                    value=50, step=10,
+                    help="Only applies to tables whose column names are generic (col1, c2, etc). Meaningful tables need zero rows.",
+                )
+
+                load_col, _ = st.columns([1, 3])
+                with load_col:
+                    load_btn = st.button("Load selected tables", use_container_width=True, type="primary")
+
+                if load_btn:
+                    if not selected_tables:
+                        st.warning("Select at least one table.")
+                    else:
+                        creds = st.session_state["trino_creds"]
+                        conn = get_trino_connection(
+                            creds["host"], creds["port"], creds["user"], creds["pass"],
+                            creds["scheme"], creds["cluster"],
+                        )
+                        try:
+                            with st.spinner(f"Fetching columns & samples for {len(selected_tables)} tables…"):
+                                loaded = trino_build_tables_smart(
+                                    conn, catalog, schema, selected_tables, sample_limit
+                                )
+                            if loaded:
+                                meaningful_count = sum(1 for df in loaded.values() if len(df) == 0)
+                                anon_count = len(loaded) - meaningful_count
+                                st.session_state["trino_loaded_tables"] = loaded
+                                st.success(
+                                    f"Loaded {len(loaded)} tables — "
+                                    f"{meaningful_count} used column names only, "
+                                    f"{anon_count} fetched row samples."
+                                )
+                            else:
+                                st.error("No tables loaded — check permissions or table names.")
+                        except Exception as e:
+                            st.error(f"Load failed: {e}")
 
         # Merge Trino tables into all_tables (takes precedence if loaded)
         if "trino_loaded_tables" in st.session_state:
@@ -1225,13 +1295,13 @@ def main():
     st.markdown('<p class="section-label"><span class="step-num">2</span> Table analysis</p>', unsafe_allow_html=True)
 
     total_tables = len(all_tables)
+    total_rows = sum(len(df) for df in all_tables.values())
     total_cols = sum(len(df.columns) for df in all_tables.values())
-    avg_cols = total_cols / total_tables if total_tables else 0
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Tables found", total_tables)
-    m2.metric("Total columns", total_cols)
-    m3.metric("Avg columns / table", f"{avg_cols:.0f}")
+    m2.metric("Total rows", f"{total_rows:,}")
+    m3.metric("Total columns", total_cols)
 
     # Build text representations
     with st.spinner("Analyzing column names and sampling values..."):
