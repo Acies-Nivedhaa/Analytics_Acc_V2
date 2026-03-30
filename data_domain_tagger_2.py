@@ -293,12 +293,12 @@ def parse_uploaded_data(uploaded_files) -> dict[str, pd.DataFrame]:
         if name.endswith((".xlsx", ".xls")):
             xls = pd.ExcelFile(uploaded_file, engine="openpyxl")
             for sheet_name in xls.sheet_names:
-                df = pd.read_excel(xls, sheet_name=sheet_name, nrows=100)
+                df = pd.read_excel(xls, sheet_name=sheet_name, nrows=20)
                 if not df.empty:
                     all_tables[sheet_name] = df
         elif name.endswith(".csv"):
             table_name = uploaded_file.name.rsplit(".", 1)[0]
-            df = pd.read_csv(uploaded_file, nrows=100)
+            df = pd.read_csv(uploaded_file, nrows=20)
             if not df.empty:
                 all_tables[table_name] = df
     return all_tables
@@ -735,6 +735,76 @@ def tag_tables(
     return results
 
 
+def tag_tables_predefined(
+    table_texts: dict[str, str],
+    table_col_analysis: dict[str, dict],
+    table_columns: dict[str, list[str]],
+    domain_labels: list[str],
+    confidence_threshold: float = 0.25,
+) -> dict[str, dict]:
+    """
+    Predefined-domain mode:
+      1. Embed all table texts (sentence-transformer, local)
+      2. Embed the domain labels
+      3. Cosine similarity: each table → best-matching domain
+      4. Below threshold → Untagged
+    """
+    import numpy as np
+    from sklearn.metrics.pairwise import cosine_similarity as cos_sim
+
+    model = load_model()
+
+    # Embed tables
+    table_names = list(table_texts.keys())
+    table_vecs = model.encode(
+        [table_texts[t] for t in table_names],
+        show_progress_bar=False, batch_size=64,
+    )
+
+    # Embed domain labels — prefix with context for better matching
+    domain_prompts = [f"{d} department data tables columns" for d in domain_labels]
+    domain_vecs = model.encode(domain_prompts, show_progress_bar=False)
+
+    # Cosine similarity matrix: (n_tables, n_domains)
+    sim_matrix = cos_sim(table_vecs, domain_vecs)
+
+    # Store vectors in session for future reuse
+    st.session_state["table_embeddings"] = {
+        "names": table_names,
+        "vectors": table_vecs,
+        "cluster_labels": [],
+    }
+
+    results = {}
+    for i, tbl in enumerate(table_names):
+        best_idx = int(np.argmax(sim_matrix[i]))
+        best_score = float(sim_matrix[i][best_idx])
+
+        if best_score >= confidence_threshold:
+            domain = domain_labels[best_idx]
+        else:
+            domain = UNTAGGED_LABEL
+
+        # Also include runner-up for context
+        sorted_idxs = np.argsort(sim_matrix[i])[::-1]
+        runner_up_idx = int(sorted_idxs[1]) if len(sorted_idxs) > 1 else best_idx
+        runner_up = domain_labels[runner_up_idx]
+        runner_up_score = float(sim_matrix[i][runner_up_idx])
+
+        results[tbl] = {
+            "domain": domain,
+            "auto_domain": domain,
+            "score": round(best_score, 3),
+            "columns": table_columns.get(tbl, []),
+            "col_analysis": table_col_analysis.get(tbl, {}),
+            "text_used": table_texts[tbl],
+            "cluster_id": best_idx if best_score >= confidence_threshold else -1,
+            "runner_up": f"{runner_up} ({runner_up_score:.2f})",
+        }
+
+    return results
+
+
 def group_by_domain(results: dict[str, dict]) -> dict[str, list[dict]]:
     grouped: dict[str, list[dict]] = {}
     for tbl, info in results.items():
@@ -748,6 +818,7 @@ def group_by_domain(results: dict[str, dict]) -> dict[str, list[dict]]:
             "col_analysis": info.get("col_analysis", {}),
             "text_used": info.get("text_used", ""),
             "auto_domain": info.get("auto_domain", domain),
+            "runner_up": info.get("runner_up", ""),
         })
     # Sort: Untagged last, rest by count descending
     def sort_key(item):
@@ -1154,13 +1225,13 @@ def main():
     st.markdown('<p class="section-label"><span class="step-num">2</span> Table analysis</p>', unsafe_allow_html=True)
 
     total_tables = len(all_tables)
-    total_rows = sum(len(df) for df in all_tables.values())
     total_cols = sum(len(df.columns) for df in all_tables.values())
+    avg_cols = total_cols / total_tables if total_tables else 0
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Tables found", total_tables)
-    m2.metric("Total rows", f"{total_rows:,}")
-    m3.metric("Total columns", total_cols)
+    m2.metric("Total columns", total_cols)
+    m3.metric("Avg columns / table", f"{avg_cols:.0f}")
 
     # Build text representations
     with st.spinner("Analyzing column names and sampling values..."):
@@ -1228,73 +1299,147 @@ def main():
     # ---------- Section 3: Configure ----------
     st.markdown('<p class="section-label"><span class="step-num">3</span> Configure</p>', unsafe_allow_html=True)
 
-    # ── Clustering params ──
-    cfg_c1, cfg_c2 = st.columns(2)
-    with cfg_c1:
-        min_cluster_size = st.slider(
-            "Min cluster size",
-            min_value=2, max_value=30, value=5, step=1,
-            help="Minimum tables per cluster. Smaller = more clusters. Tables that don't fit any cluster → Untagged.",
+    # ── Domain mode selection ──
+    # Check if domains were loaded from sidebar config
+    loaded_domains = st.session_state.pop("load_domain_config", None)
+    if loaded_domains:
+        st.session_state["predefined_domains_text"] = ", ".join(loaded_domains)
+
+    # Determine default mode: if domains are loaded, default to predefined
+    has_predefined = bool(st.session_state.get("predefined_domains_text", "").strip())
+    default_mode_idx = 1 if has_predefined else 0
+
+    tagging_mode = st.radio(
+        "Tagging mode",
+        options=["Auto-discover domains", "Match to predefined domains"],
+        index=default_mode_idx,
+        horizontal=True,
+        help="Auto-discover uses UMAP + HDBSCAN to find natural clusters. Predefined matches every table to one of your specified domains.",
+    )
+
+    use_predefined = tagging_mode == "Match to predefined domains"
+
+    if use_predefined:
+        # ── Predefined domain config ──
+        predefined_text = st.text_area(
+            "Domain labels (comma-separated)",
+            value=st.session_state.get("predefined_domains_text", ""),
+            placeholder="e.g. Customer, Sales, Product, Finance, Logistics, HR, Telemetry",
+            height=68,
+            key="predefined_domains_input",
         )
-    with cfg_c2:
-        gemini_api_key = st.text_input(
-            "Gemini API key (for cluster labelling)",
-            type="password",
-            placeholder="AIza...",
-            help="Optional — without a key, labels fall back to table name tokens. 1 API call per cluster, very cheap.",
-        )
-    if not gemini_api_key.strip():
-        st.caption("No API key — cluster labels will be inferred from table name tokens.")
+        # Keep in session so it persists
+        st.session_state["predefined_domains_text"] = predefined_text
 
-    # Save domain config (still useful for manual label overrides in sidebar)
-    with st.expander("Save a manual domain label set"):
-        manual_labels_input = st.text_area(
-            "Domain labels",
-            placeholder="e.g. Customer, Sales, Product, Finance, Logistics, HR",
-            height=68, label_visibility="collapsed",
-        )
-        cfg_col1, cfg_col2 = st.columns([3, 1])
-        with cfg_col1:
-            cfg_name = st.text_input("Config name", placeholder="e.g. Retail domains", label_visibility="collapsed")
-        with cfg_col2:
-            if st.button("Save config", use_container_width=True):
-                if not cfg_name.strip():
-                    st.warning("Enter a name.")
-                elif not manual_labels_input.strip():
-                    st.warning("No labels to save.")
-                else:
-                    labels = [d.strip().title() for d in manual_labels_input.split(",") if d.strip()]
-                    db_save_domain_config(cfg_name.strip(), labels)
-                    st.success(f"Saved '{cfg_name}'")
-                    st.rerun()
+        predefined_labels = [d.strip().title() for d in predefined_text.split(",") if d.strip()]
 
-    confidence_threshold = DEFAULT_CONFIDENCE_THRESHOLD  # kept for SQLite compat
-
-    st.markdown("")
-    if st.button("Cluster & label tables", type="primary", use_container_width=True):
-
-        n_tables = len(table_texts)
-        with st.spinner(f"Embedding {n_tables} tables (local, no API)…"):
-            pass  # embed happens inside tag_tables
-
-        with st.spinner("Clustering with UMAP + HDBSCAN…"):
-            pass
-
-        gemini_note = "then labelling clusters with Gemini Flash…" if gemini_api_key.strip() else "then labelling clusters from table names…"
-        with st.spinner(gemini_note):
-            results = tag_tables(
-                table_texts, table_col_analysis,
-                table_columns, min_cluster_size,
-                gemini_api_key,
+        if predefined_labels:
+            pills_html = " ".join(
+                f'<span class="quality-meaningful">{d}</span>' for d in predefined_labels
             )
+            st.markdown(f"{len(predefined_labels)} domains: {pills_html}", unsafe_allow_html=True)
+        else:
+            st.warning("Enter at least one domain label, or load a saved config from the sidebar.")
 
-        domain_labels = sorted(set(r["domain"] for r in results.values()))
+        cfg_c1, cfg_c2 = st.columns(2)
+        with cfg_c1:
+            confidence_threshold = st.slider(
+                "Confidence threshold",
+                min_value=0.05, max_value=0.60, value=DEFAULT_CONFIDENCE_THRESHOLD, step=0.05,
+                help="Tables scoring below this against all domains go to Untagged.",
+            )
+        with cfg_c2:
+            # Save config shortcut
+            with st.expander("Save this domain set"):
+                cfg_name = st.text_input("Config name", placeholder="e.g. Retail domains", label_visibility="collapsed", key="save_cfg_name")
+                if st.button("Save config", use_container_width=True):
+                    if not cfg_name.strip():
+                        st.warning("Enter a name.")
+                    elif not predefined_labels:
+                        st.warning("No labels to save.")
+                    else:
+                        db_save_domain_config(cfg_name.strip(), predefined_labels)
+                        st.success(f"Saved '{cfg_name}'")
+                        st.rerun()
+
+    else:
+        # ── Auto-discover config ──
+        cfg_c1, cfg_c2 = st.columns(2)
+        with cfg_c1:
+            min_cluster_size = st.slider(
+                "Min cluster size",
+                min_value=2, max_value=30, value=5, step=1,
+                help="Minimum tables per cluster. Smaller = more clusters. Tables that don't fit any cluster go to Untagged.",
+            )
+        with cfg_c2:
+            gemini_api_key = st.text_input(
+                "Gemini API key (for cluster labelling)",
+                type="password",
+                placeholder="AIza...",
+                help="Optional — without a key, labels fall back to table name tokens. 1 API call per cluster, very cheap.",
+            )
+        if not gemini_api_key.strip():
+            st.caption("No API key — cluster labels will be inferred from table name tokens.")
+
+        confidence_threshold = DEFAULT_CONFIDENCE_THRESHOLD
+
+        # Save domain config
+        with st.expander("Save a manual domain label set"):
+            manual_labels_input = st.text_area(
+                "Domain labels",
+                placeholder="e.g. Customer, Sales, Product, Finance, Logistics, HR",
+                height=68, label_visibility="collapsed",
+            )
+            cfg_col1, cfg_col2 = st.columns([3, 1])
+            with cfg_col1:
+                cfg_name = st.text_input("Config name", placeholder="e.g. Retail domains", label_visibility="collapsed")
+            with cfg_col2:
+                if st.button("Save config", use_container_width=True):
+                    if not cfg_name.strip():
+                        st.warning("Enter a name.")
+                    elif not manual_labels_input.strip():
+                        st.warning("No labels to save.")
+                    else:
+                        labels = [d.strip().title() for d in manual_labels_input.split(",") if d.strip()]
+                        db_save_domain_config(cfg_name.strip(), labels)
+                        st.success(f"Saved '{cfg_name}'")
+                        st.rerun()
+
+    # ── Run button ──
+    st.markdown("")
+    button_label = "Match tables to domains" if use_predefined else "Cluster & label tables"
+    if st.button(button_label, type="primary", use_container_width=True):
+
+        if use_predefined:
+            if not predefined_labels:
+                st.error("Enter at least one domain label first.")
+                st.stop()
+
+            with st.spinner(f"Embedding {len(table_texts)} tables + {len(predefined_labels)} domains…"):
+                results = tag_tables_predefined(
+                    table_texts, table_col_analysis,
+                    table_columns, predefined_labels,
+                    confidence_threshold,
+                )
+        else:
+            with st.spinner(f"Embedding {len(table_texts)} tables, clustering, and labelling…"):
+                results = tag_tables(
+                    table_texts, table_col_analysis,
+                    table_columns, min_cluster_size,
+                    gemini_api_key,
+                )
+
+        # In predefined mode, include ALL input labels so reassignment dropdown has every option
+        if use_predefined:
+            domain_labels = sorted(set(predefined_labels + [r["domain"] for r in results.values()]))
+        else:
+            domain_labels = sorted(set(r["domain"] for r in results.values()))
 
         # Store in session state
         st.session_state["tag_results"] = results
         st.session_state["domain_labels_used"] = domain_labels
         st.session_state["last_threshold"] = confidence_threshold
-        # Initialize user overrides dict (empty = no overrides yet)
+        st.session_state["last_mode"] = tagging_mode
         st.session_state["user_overrides"] = {}
 
     # ---------- Section 4: Results with editable domains ----------
@@ -1330,8 +1475,13 @@ def main():
     m3.metric("Domains", num_domains)
     m4.metric("Reassigned by you", num_reassigned)
 
+    last_mode = st.session_state.get("last_mode", "Auto-discover domains")
+    mode_label = "Predefined" if "Predefined" in last_mode or "predefined" in last_mode or "Match" in last_mode else "Auto-discover"
+
     st.markdown(
         f'<div class="summary-bar">'
+        f'<span>Mode: <b>{mode_label}</b></span>'
+        f'<span class="dot"></span>'
         f'<span>Domains: <b>{", ".join(domain_labels_used)}</b></span>'
         f'<span class="dot"></span>'
         f'<span>Threshold: <b>{confidence_threshold}</b></span>'
@@ -1343,8 +1493,11 @@ def main():
 
     st.markdown("")
 
-    # Dropdown options for reassignment
-    reassign_options = domain_labels_used + [UNTAGGED_LABEL]
+    # Dropdown options for reassignment — include all predefined domains even if no tables matched
+    reassign_options = sorted(set(domain_labels_used))
+    if UNTAGGED_LABEL in reassign_options:
+        reassign_options.remove(UNTAGGED_LABEL)
+    reassign_options.append(UNTAGGED_LABEL)
 
     # ---------- Render each domain group ----------
     for idx, (domain, tbl_list) in enumerate(grouped.items()):
@@ -1396,8 +1549,10 @@ def main():
                     auto_note = ""
                     if tbl_name in user_overrides:
                         auto_note = f"  ← was *{auto_domain}*"
+                    runner_up = t.get("runner_up", "")
+                    runner_note = f"  · 2nd: {runner_up}" if runner_up else ""
                     st.markdown(f"**`{tbl_name}`** · {t['score']:.3f}{auto_note}")
-                    st.caption(f"{t['text_used'][:120]}{'…' if len(t['text_used']) > 120 else ''}")
+                    st.caption(f"{t['text_used'][:120]}{'…' if len(t['text_used']) > 120 else ''}{runner_note}")
 
                 with col_reassign:
                     current_idx = reassign_options.index(current_domain) if current_domain in reassign_options else 0
