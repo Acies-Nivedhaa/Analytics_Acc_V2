@@ -270,6 +270,362 @@ def trino_build_tables(
 
 
 # ---------------------------------------------------------------------------
+# SAP Enrichment — translates cryptic SAP names into English for embeddings
+# ---------------------------------------------------------------------------
+
+class SAPEnricher:
+    """
+    Detects SAP sources and enriches cryptic table/field names with
+    human-readable descriptions before they hit the embedding pipeline.
+
+    Bundled lookup covers ~185 standard tables, ~110 field abbreviations,
+    and ~37 prefix-based heuristics.  No external CSV files needed.
+    """
+
+    # ── Table name → (description, module) ──
+    TABLE_LOOKUP: dict[str, tuple[str, str]] = {
+        # FI
+        "BKPF": ("Accounting Document Header", "FI"),
+        "BSEG": ("Accounting Document Segment", "FI"),
+        "BSID": ("Customer Open Items", "FI"),
+        "BSIK": ("Vendor Open Items", "FI"),
+        "BSAD": ("Customer Cleared Items", "FI"),
+        "BSAK": ("Vendor Cleared Items", "FI"),
+        "BSIS": ("G/L Account Open Items", "FI"),
+        "BSAS": ("G/L Account Cleared Items", "FI"),
+        "SKA1": ("G/L Account Master Chart of Accounts", "FI"),
+        "SKB1": ("G/L Account Master Company Code", "FI"),
+        "SKAT": ("G/L Account Master Description", "FI"),
+        "FAGLFLEXA": ("General Ledger Line Items", "FI"),
+        "FAGLFLEXT": ("General Ledger Totals", "FI"),
+        "T001": ("Company Codes", "FI"),
+        "T003": ("Document Types", "FI"),
+        "T009": ("Fiscal Year Variants", "FI"),
+        "ACDOCA": ("Universal Journal Entry Line Items", "FI"),
+        # FI-AP
+        "LFA1": ("Vendor Master General Data", "FI-AP"),
+        "LFB1": ("Vendor Master Company Code Data", "FI-AP"),
+        "LFBK": ("Vendor Master Bank Details", "FI-AP"),
+        # FI-AR
+        "KNA1": ("Customer Master General Data", "FI-AR"),
+        "KNB1": ("Customer Master Company Code Data", "FI-AR"),
+        "KNBK": ("Customer Master Bank Details", "FI-AR"),
+        "KNVV": ("Customer Master Sales Data", "FI-AR"),
+        # FI-AA
+        "ANLA": ("Asset Master Record Segment", "FI-AA"),
+        "ANLB": ("Depreciation Terms", "FI-AA"),
+        "ANLC": ("Asset Value Fields", "FI-AA"),
+        "ANLZ": ("Asset Time Dependent Data", "FI-AA"),
+        "ANEK": ("Asset Document Header", "FI-AA"),
+        "ANEP": ("Asset Document Line Items", "FI-AA"),
+        # CO
+        "CSKS": ("Cost Center Master Data", "CO"),
+        "CSKT": ("Cost Center Texts", "CO"),
+        "CSKA": ("Cost Elements Chart of Accounts", "CO"),
+        "CSKB": ("Cost Elements Controlling Area", "CO"),
+        "CEPC": ("Profit Center Master Data", "CO"),
+        "CEPCT": ("Profit Center Texts", "CO"),
+        "COBK": ("CO Document Header", "CO"),
+        "COEP": ("CO Document Line Items", "CO"),
+        "COSP": ("CO Totals Externally Posted", "CO"),
+        "COSS": ("CO Totals Internally Posted", "CO"),
+        "AUFK": ("Order Master Data", "CO"),
+        "TKA01": ("Controlling Areas", "CO"),
+        # MM
+        "MARA": ("Material Master General Data", "MM"),
+        "MAKT": ("Material Descriptions", "MM"),
+        "MARC": ("Material Master Plant Data", "MM"),
+        "MARD": ("Material Master Storage Location Data", "MM"),
+        "MARM": ("Material Master Units of Measure", "MM"),
+        "MBEW": ("Material Valuation", "MM"),
+        "MVER": ("Material Consumption", "MM"),
+        "MVKE": ("Material Master Sales Data", "MM"),
+        "MKPF": ("Material Document Header", "MM"),
+        "MSEG": ("Material Document Segment", "MM"),
+        "T001W": ("Plants", "MM"),
+        "T001L": ("Storage Locations", "MM"),
+        "T023": ("Material Groups", "MM"),
+        "T024": ("Purchasing Groups", "MM"),
+        "T134": ("Material Types", "MM"),
+        # MM-PUR
+        "EBAN": ("Purchase Requisition", "MM-PUR"),
+        "EBKN": ("Purchase Requisition Account Assignment", "MM-PUR"),
+        "EKKO": ("Purchasing Document Header", "MM-PUR"),
+        "EKPO": ("Purchasing Document Item", "MM-PUR"),
+        "EKET": ("Scheduling Agreement Schedule Lines", "MM-PUR"),
+        "EKKN": ("Account Assignment in Purchasing Document", "MM-PUR"),
+        "EKBE": ("Purchasing Document History", "MM-PUR"),
+        "EINA": ("Purchasing Info Record General Data", "MM-PUR"),
+        "EINE": ("Purchasing Info Record Purchasing Org Data", "MM-PUR"),
+        "EORD": ("Purchasing Source List", "MM-PUR"),
+        # SD
+        "VBAK": ("Sales Document Header", "SD"),
+        "VBAP": ("Sales Document Item", "SD"),
+        "VBEP": ("Sales Document Schedule Line", "SD"),
+        "VBKD": ("Sales Document Business Data", "SD"),
+        "VBPA": ("Sales Document Partner", "SD"),
+        "VBFA": ("Sales Document Flow", "SD"),
+        "VBUK": ("Sales Document Header Status", "SD"),
+        "VBUP": ("Sales Document Item Status", "SD"),
+        "LIKP": ("Delivery Document Header", "SD"),
+        "LIPS": ("Delivery Document Item", "SD"),
+        "VBRK": ("Billing Document Header", "SD"),
+        "VBRP": ("Billing Document Item", "SD"),
+        "VTTK": ("Shipment Header", "SD"),
+        "VTTP": ("Shipment Item", "SD"),
+        "KONV": ("Sales Pricing Conditions", "SD"),
+        "KONP": ("Condition Item", "SD"),
+        "KONH": ("Condition Header", "SD"),
+        "TVKO": ("Sales Organizations", "SD"),
+        # PP
+        "AFKO": ("Production Order Header", "PP"),
+        "AFPO": ("Production Order Item", "PP"),
+        "AFVC": ("Production Order Operations", "PP"),
+        "PLKO": ("Routing Header", "PP"),
+        "PLPO": ("Routing Operation", "PP"),
+        "STKO": ("BOM Header", "PP"),
+        "STPO": ("BOM Item", "PP"),
+        "MAST": ("Material to BOM Link", "PP"),
+        "RESB": ("Reservation Dependent Requirements", "PP"),
+        # PM
+        "EQUI": ("Equipment Master", "PM"),
+        "IFLOT": ("Functional Location Data", "PM"),
+        "ILOA": ("PM Object Location and Account Assignment", "PM"),
+        "AFIH": ("Maintenance Order Header", "PM"),
+        "MPLA": ("Maintenance Plan Header", "PM"),
+        # QM
+        "QALS": ("Inspection Lot", "QM"),
+        "QAVE": ("Inspection Lot Usage Decision", "QM"),
+        # HR
+        "PA0000": ("HR Master Actions", "HR"),
+        "PA0001": ("HR Master Org Assignment", "HR"),
+        "PA0002": ("HR Master Personal Data", "HR"),
+        "PA0006": ("HR Master Addresses", "HR"),
+        "PA0008": ("HR Master Basic Pay", "HR"),
+        "HRP1000": ("HR Object Infotype Object", "HR"),
+        "HRP1001": ("HR Object Infotype Relationships", "HR"),
+        # WM
+        "LQUA": ("Warehouse Quants", "WM"),
+        "LTAP": ("Transfer Order Item", "WM"),
+        "LTAK": ("Transfer Order Header", "WM"),
+        "LAGP": ("Storage Bins", "WM"),
+        # Basis
+        "USR02": ("User Logon Data", "BASIS"),
+        "TSTC": ("SAP Transaction Codes", "BASIS"),
+        "TADIR": ("Directory of Repository Objects", "BASIS"),
+        "DD02L": ("SAP Tables", "BASIS"),
+        "DD02T": ("SAP Table Descriptions", "BASIS"),
+        "DD03L": ("Table Fields", "BASIS"),
+        "DD04T": ("Data Element Texts", "BASIS"),
+        "CDHDR": ("Change Document Header", "BASIS"),
+        "CDPOS": ("Change Document Items", "BASIS"),
+        "ADRC": ("Address Data", "BASIS"),
+        "ADR6": ("Email Addresses", "BASIS"),
+        "ADRCT": ("Address Texts", "BASIS"),
+        "BUT000": ("Business Partner General Data", "BASIS"),
+        "BUT020": ("Business Partner Addresses", "BASIS"),
+        # Config / Customizing text tables
+        "T002": ("Language Keys", "BASIS"),
+        "T002T": ("Language Names", "BASIS"),
+        "T005": ("Countries", "BASIS"),
+        "T005S": ("Taxes Region", "BASIS"),
+        "T005T": ("Country Names", "BASIS"),
+        "T005K": ("Country Tax Keys", "BASIS"),
+        "T006": ("Units of Measurement", "BASIS"),
+        "T006A": ("Units of Measurement Texts", "BASIS"),
+        "T006T": ("Units of Measurement Names", "BASIS"),
+        "T007A": ("Tax Keys", "FI"),
+        "T009B": ("Fiscal Year Variant Periods", "FI"),
+        "T023T": ("Material Group Descriptions", "MM"),
+        "T134T": ("Material Type Descriptions", "MM"),
+        "T179": ("Materials Product Hierarchies", "MM"),
+        "T179T": ("Product Hierarchy Texts", "MM"),
+        "T881": ("Ledger in General Ledger", "FI"),
+        "T881T": ("Ledger Names", "FI"),
+        "TCURF": ("Currency Conversion Factors", "FI"),
+        "TCURR": ("Exchange Rates", "FI"),
+        "TCURX": ("Currency Decimal Places", "FI"),
+        "TCURC": ("Currency Codes", "FI"),
+        "TCURT": ("Currency Names", "FI"),
+        "TKA02": ("Controlling Area Assignment", "CO"),
+        "TVKOT": ("Sales Organization Texts", "SD"),
+        "TVTW": ("Distribution Channels", "SD"),
+        "TVTWT": ("Distribution Channel Texts", "SD"),
+        "ANKT": ("Asset Class Texts", "FI-AA"),
+        # Invoice Verification / Logistics Invoice
+        "RBKP": ("Invoice Document Header", "MM-IV"),
+        "RSEG": ("Invoice Document Item", "MM-IV"),
+        "RBCO": ("Invoice Document Account Assignment", "MM-IV"),
+        # Purchasing additional
+        "EKES": ("Vendor Confirmations", "MM-PUR"),
+        "EKPO": ("Purchasing Document Item", "MM-PUR"),
+        # SET tables (hierarchy / grouping)
+        "SETHEADERT": ("Set Header Texts", "BASIS"),
+        "SETLEAF": ("Set Single Values", "BASIS"),
+        "SETNODE": ("Set Hierarchy Nodes", "BASIS"),
+        # S/4HANA
+        "MATDOC": ("Material Document S4HANA", "S4-MM"),
+        "PRCD_ELEMENTS": ("Pricing Conditions S4HANA", "S4-SD"),
+    }
+
+    # ── Field abbreviation → description ──
+    FIELD_LOOKUP: dict[str, str] = {
+        # Organizational
+        "MANDT": "Client", "BUKRS": "Company Code", "WERKS": "Plant",
+        "VKORG": "Sales Organization", "VTWEG": "Distribution Channel",
+        "SPART": "Division", "EKORG": "Purchasing Organization",
+        "LGORT": "Storage Location", "GSBER": "Business Area",
+        "KOKRS": "Controlling Area", "KOSTL": "Cost Center", "PRCTR": "Profit Center",
+        "VKBUR": "Sales Office", "VKGRP": "Sales Group",
+        # Master data keys
+        "MATNR": "Material Number", "KUNNR": "Customer Number",
+        "LIFNR": "Vendor Number", "SAKNR": "GL Account Number",
+        "ANLN1": "Asset Main Number", "PERNR": "Personnel Number",
+        "EQUNR": "Equipment Number", "AUFNR": "Order Number",
+        # Document keys
+        "VBELN": "Sales Document Number", "EBELN": "Purchasing Document Number",
+        "BELNR": "Accounting Document Number", "MBLNR": "Material Document Number",
+        "GJAHR": "Fiscal Year", "MONAT": "Fiscal Period",
+        "POSNR": "Item Number", "EBELP": "Purchasing Document Item",
+        "BUZEI": "Accounting Document Line Item",
+        # Quantity / Amount
+        "MENGE": "Quantity", "MEINS": "Base Unit of Measure",
+        "BRGEW": "Gross Weight", "NTGEW": "Net Weight", "GEWEI": "Weight Unit",
+        "WRBTR": "Amount in Document Currency", "DMBTR": "Amount in Local Currency",
+        "NETWR": "Net Value", "NETPR": "Net Price", "WAERS": "Currency Key",
+        # Date
+        "ERDAT": "Created On Date", "AEDAT": "Changed On Date",
+        "BUDAT": "Posting Date", "BLDAT": "Document Date",
+        "CPUDT": "Entry Date", "LFDAT": "Delivery Date",
+        "AUDAT": "Document Date", "FKDAT": "Billing Date",
+        # User / status
+        "ERNAM": "Created By", "AENAM": "Changed By", "USNAM": "User Name",
+        "LOEKZ": "Deletion Indicator", "STATU": "Status",
+        "GBSTK": "Overall Status", "LFSTK": "Delivery Status", "FKSTK": "Billing Status",
+        # Material
+        "MTART": "Material Type", "MATKL": "Material Group",
+        "MBRSH": "Industry Sector", "MAKTX": "Material Description",
+        "LABST": "Unrestricted Stock", "INSME": "Quality Inspection Stock",
+        "SPEME": "Blocked Stock", "EKGRP": "Purchasing Group",
+        # Partner
+        "NAME1": "Name 1", "NAME2": "Name 2", "LAND1": "Country Key",
+        "ORT01": "City", "PSTLZ": "Postal Code", "REGIO": "Region State",
+        "STRAS": "Street", "TELF1": "Telephone", "ADRNR": "Address Number",
+        "ZTERM": "Payment Terms", "INCO1": "Incoterms",
+        # Sales
+        "AUART": "Sales Document Type", "AUGRU": "Order Reason",
+        "BSTNK": "Customer Purchase Order Number",
+        "KNUMV": "Pricing Condition Number", "VSBED": "Shipping Conditions",
+        "KUNAG": "Sold To Party", "KUNWE": "Ship To Party", "KUNRG": "Payer",
+        # Purchasing
+        "BSART": "Purchasing Document Type", "BSTYP": "Purchasing Document Category",
+        "BANFN": "Purchase Requisition Number", "BEDAT": "Purchasing Document Date",
+        # Finance
+        "BSCHL": "Posting Key", "HKONT": "GL Account Number",
+        "KOART": "Account Type", "SHKZG": "Debit Credit Indicator",
+        "BLART": "Document Type", "XBLNR": "Reference Document Number",
+        "ZUONR": "Assignment Number", "SGTXT": "Item Text", "KTOPL": "Chart of Accounts",
+    }
+
+    # ── Prefix → domain hint (longest-match-first) ──
+    PREFIX_PATTERNS: dict[str, str] = {
+        "MARA": "Material Master", "MAR": "Material Master", "MAK": "Material Description",
+        "VBA": "Sales Document", "VBR": "Billing Document", "VBU": "Sales Document Status",
+        "LIK": "Delivery Document", "LIP": "Delivery Item",
+        "EKK": "Purchasing Document Header", "EKP": "Purchasing Document Item",
+        "EKB": "Purchasing Document History", "EKE": "Vendor Confirmations",
+        "EBA": "Purchase Requisition",
+        "BKP": "Accounting Document Header", "BSE": "Accounting Document Segment",
+        "BSI": "Open Items", "BSA": "Cleared Items",
+        "ANL": "Asset", "ANK": "Asset Class",
+        "CSK": "Cost Center or Cost Element",
+        "CEP": "Profit Center", "COB": "Controlling Document",
+        "COE": "Controlling Line Items", "COS": "Controlling Totals",
+        "AFV": "Production Order Operations",
+        "AFK": "Production Order", "AFP": "Production Order Item",
+        "LFA": "Vendor Master", "LFB": "Vendor Master Company Code",
+        "KNA": "Customer Master", "KNB": "Customer Master Company Code",
+        "KNV": "Customer Master Sales",
+        "KON": "Pricing Conditions",
+        "PA0": "HR Master Infotype", "HRP": "HR Object",
+        "QAL": "Inspection Lot",
+        "TCUR": "Currency Exchange Rates",
+        "TVK": "Sales Organization Config", "TVT": "Distribution Channel Config",
+        "SET": "Set Hierarchy Grouping",
+        "RBK": "Invoice Verification", "RBC": "Invoice Account Assignment",
+        "RSE": "Invoice Verification Item",
+        "ADR": "Address Data",
+        "BUT": "Business Partner",
+        "SKA": "GL Account Master", "SKB": "GL Account Company Code",
+        "FAGL": "General Ledger",
+        "TKA": "Controlling Area Config",
+        "T00": "Configuration Customizing", "T01": "Configuration Customizing",
+        "T02": "Configuration Customizing", "T13": "Material Configuration",
+        "T17": "Product Hierarchy Config", "T88": "Ledger Configuration",
+        "T005": "Country Configuration", "T006": "Units of Measurement",
+        "T007": "Tax Configuration", "T009": "Fiscal Year Configuration",
+        "USR": "User Master",
+        "AGR": "Authorization Role", "DD0": "Data Dictionary Metadata",
+        "CDH": "Change Document Header", "CDP": "Change Document Items",
+    }
+
+    # Sorted by length descending for longest-prefix-first matching
+    _sorted_prefixes = sorted(PREFIX_PATTERNS.keys(), key=len, reverse=True)
+
+    @classmethod
+    def is_sap_source(cls, table_names: list[str], threshold: float = 0.35) -> bool:
+        """Auto-detect whether a list of table names looks like SAP."""
+        if not table_names:
+            return False
+        sap_signals = 0
+        for t in table_names:
+            tu = t.upper().strip()
+            if tu in cls.TABLE_LOOKUP:
+                sap_signals += 1
+                continue
+            # Looks like SAP: ALL CAPS, 3-10 chars, mostly no underscores
+            if re.match(r'^[A-Z0-9_]{3,10}$', tu) and not re.search(r'[a-z ]', t):
+                for prefix in cls._sorted_prefixes:
+                    if tu.startswith(prefix):
+                        sap_signals += 1
+                        break
+                else:
+                    if tu.startswith(('Z', 'Y')) and len(tu) <= 10:
+                        sap_signals += 0.5
+        return (sap_signals / len(table_names)) >= threshold
+
+    @classmethod
+    def enrich_table_name(cls, table_name: str) -> str:
+        """Return English description for a SAP table name, or original if unknown."""
+        tu = table_name.upper().strip()
+        if tu in cls.TABLE_LOOKUP:
+            return cls.TABLE_LOOKUP[tu][0]
+        for prefix in cls._sorted_prefixes:
+            if tu.startswith(prefix):
+                return f"{cls.PREFIX_PATTERNS[prefix]} ({tu})"
+        return table_name
+
+    @classmethod
+    def enrich_field_name(cls, field_name: str) -> str:
+        """Return English description for a SAP field name, or original if unknown."""
+        fu = field_name.upper().strip()
+        return cls.FIELD_LOOKUP.get(fu, field_name)
+
+    @classmethod
+    def enrich_for_embedding(cls, table_name: str, column_names: list[str] | None = None) -> str:
+        """
+        Build a rich text string for embedding from SAP table + columns.
+        Example: VBAK + [VBELN, ERDAT, NETWR] →
+                 "Sales Document Header Sales Document Number Created On Date Net Value"
+        """
+        table_desc = cls.enrich_table_name(table_name)
+        if not column_names:
+            return table_desc
+        field_descs = [cls.enrich_field_name(c) for c in column_names[:25]]
+        return f"{table_desc} {' '.join(field_descs)}"
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 DEFAULT_CONFIDENCE_THRESHOLD = 0.25
@@ -495,10 +851,33 @@ def detect_sample_values(values: list) -> list[str]:
 #   - Mixed → column-by-column decision
 # ---------------------------------------------------------------------------
 
-def build_table_text(table_name: str, df: pd.DataFrame) -> tuple[str, str, dict]:
+def build_table_text(table_name: str, df: pd.DataFrame, is_sap: bool = False) -> tuple[str, str, dict]:
     columns = list(df.columns)
     quality = detect_column_quality_per_table(columns)
 
+    # ── SAP enrichment path ──────────────────────────────────────────────
+    # SAP columns ARE meaningful (they're real field names, not col1/col2),
+    # but the names are cryptic abbreviations.  We translate them to English
+    # descriptions so the embedding model can understand them.
+    if is_sap:
+        quality = "meaningful"  # SAP fields are meaningful, just abbreviated
+        col_analysis = {}
+        enriched_table = SAPEnricher.enrich_table_name(table_name)
+        text_parts = [enriched_table]
+
+        for col in columns:
+            enriched_col = SAPEnricher.enrich_field_name(col)
+            col_analysis[col] = {
+                "quality": "meaningful",
+                "pattern": f"SAP → {enriched_col}" if enriched_col != col else "SAP (unknown)",
+                "samples": detect_sample_values(df[col].dropna().head(10).tolist()) if len(df) > 0 else [],
+            }
+            text_parts.append(enriched_col)
+
+        text = " ".join(text_parts)
+        return text, quality, col_analysis
+
+    # ── Standard path (non-SAP) ──────────────────────────────────────────
     col_analysis = {}
     text_parts = [table_name]
 
@@ -603,10 +982,17 @@ def cluster_embeddings(embeddings: "np.ndarray", min_cluster_size: int = 5) -> "
     import hdbscan
 
     n = len(embeddings)
+
+    # Too few tables for UMAP — give each table its own cluster
+    # so they each get individually labelled rather than forced together
+    if n < 4:
+        return np.arange(n, dtype=int)
+
     # UMAP: reduce to 10d for clustering quality, cap neighbors sensibly
-    n_neighbors = max(5, min(15, n // 10))
+    n_components = max(2, min(10, n - 2))
+    n_neighbors = max(2, min(15, n // 10))
     reducer = umap.UMAP(
-        n_components=min(10, n - 2),
+        n_components=n_components,
         n_neighbors=n_neighbors,
         min_dist=0.0,
         metric="cosine",
@@ -614,9 +1000,13 @@ def cluster_embeddings(embeddings: "np.ndarray", min_cluster_size: int = 5) -> "
     )
     reduced = reducer.fit_transform(embeddings)
 
+    # Adjust min_cluster_size to not exceed table count
+    effective_min_cluster = max(2, min(min_cluster_size, n // 2))
+    effective_min_samples = max(1, min(3, effective_min_cluster - 1))
+
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=3,
+        min_cluster_size=effective_min_cluster,
+        min_samples=effective_min_samples,
         metric="euclidean",
         cluster_selection_method="eom",
     )
@@ -655,6 +1045,42 @@ def label_cluster_gemini(
     with urllib.request.urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read())
     return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
+def _label_from_texts(tables: list[str], table_texts: dict[str, str]) -> str:
+    """
+    Generate a cluster label from the enriched table_texts (not raw table names).
+    Tokenizes the English descriptions and picks the two most common meaningful words.
+    This ensures SAP-enriched tables get labels like 'Sales Document' instead of 'Vbrk'.
+    """
+    label_stopwords = {
+        "data", "master", "general", "document", "table", "header", "item",
+        "segment", "line", "items", "record", "texts", "number", "code",
+        "type", "key", "name", "date", "status", "value", "the", "and",
+        "for", "from", "with", "account", "fields", "area", "org",
+        "sap", "company", "created", "changed", "amount", "unit",
+        "net", "base", "country", "city", "region", "street", "postal",
+        "indicator", "currency", "fiscal", "price", "quantity", "weight",
+        "deletion", "debit", "credit", "assignment", "reference",
+        "telephone", "address", "chart", "local", "party", "overall",
+    }
+    words: list[str] = []
+    for t in tables:
+        text = table_texts.get(t, t)
+        parts = re.split(r"[_\-.\s]+", text.lower())
+        for p in parts:
+            if p and p not in label_stopwords and len(p) > 2 and not p.isdigit():
+                words.append(p)
+
+    if not words:
+        return f"Group {tables[0]}" if tables else "Unknown"
+
+    top = Counter(words).most_common(3)
+
+    # Try to build a 2-word label from the top tokens
+    if len(top) >= 2:
+        return f"{top[0][0].title()} {top[1][0].title()}"
+    return top[0][0].title()
 
 
 def tag_tables(
@@ -699,17 +1125,11 @@ def tag_tables(
                 label = label_cluster_gemini(tables, table_texts, gemini_api_key)
                 cluster_to_domain[cl_id] = label
             except Exception as e:
-                # Fallback: use most common word from table names in cluster
-                words = []
-                for t in tables:
-                    words += [p for p in re.split(r"[_\-\.\s]+", t.lower()) if len(p) > 2]
-                cluster_to_domain[cl_id] = Counter(words).most_common(1)[0][0].title() if words else f"Cluster {cl_id}"
+                # Fallback: use most common word from enriched table texts
+                cluster_to_domain[cl_id] = _label_from_texts(tables, table_texts)
         else:
-            # No API key: fallback label from table name tokens
-            words = []
-            for t in tables:
-                words += [p for p in re.split(r"[_\-\.\s]+", t.lower()) if len(p) > 2]
-            cluster_to_domain[cl_id] = Counter(words).most_common(1)[0][0].title() if words else f"Cluster {cl_id}"
+            # No API key: fallback label from enriched table texts
+            cluster_to_domain[cl_id] = _label_from_texts(tables, table_texts)
 
     # Compute per-table score = HDBSCAN soft membership (use cosine to cluster centroid as proxy)
     from sklearn.metrics.pairwise import cosine_similarity as cos_sim
@@ -1338,12 +1758,25 @@ def main():
         table_col_analysis = {}
         table_columns = {}
 
+        # ── SAP auto-detection ──
+        is_sap = SAPEnricher.is_sap_source(list(all_tables.keys()))
+
         for tbl_name, df in all_tables.items():
-            text, quality, col_analysis = build_table_text(tbl_name, df)
+            text, quality, col_analysis = build_table_text(tbl_name, df, is_sap=is_sap)
             table_texts[tbl_name] = text
             table_qualities[tbl_name] = quality
             table_col_analysis[tbl_name] = col_analysis
             table_columns[tbl_name] = list(df.columns)
+
+    # ── SAP enrichment notice ──
+    if is_sap:
+        matched = sum(1 for t in all_tables if t.upper().strip() in SAPEnricher.TABLE_LOOKUP)
+        st.info(
+            f"SAP source detected — enriching cryptic table/field names with English descriptions "
+            f"before embedding. {matched}/{len(all_tables)} tables matched the built-in SAP lookup, "
+            f"remainder handled via prefix heuristics.",
+            icon="🔄",
+        )
 
     q_counts = Counter(table_qualities.values())
 

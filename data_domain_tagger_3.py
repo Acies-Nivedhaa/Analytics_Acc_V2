@@ -231,34 +231,22 @@ def trino_build_tables(
     conn, catalog: str, schema: str, tables: list[str], sample_limit: int = 20
 ) -> dict[str, pd.DataFrame]:
     """
-    For each table:
-      1. Get columns via SELECT * LIMIT 0 + cursor.description
-      2. Check column quality (meaningful vs anonymous)
-      3. If meaningful → empty DataFrame with column headers only (no row scan needed)
-      4. If anonymous/mixed → fetch sample_limit rows for pattern detection
+    For each table, fetch column names + a sample of rows.
+    Always fetches rows so the UI can show previews and row counts.
+    Column quality (meaningful vs anonymous) is checked later during
+    embedding — it only affects what text goes into the vector, not
+    whether rows are loaded.
     Returns {table_name: DataFrame}.
     """
     result: dict[str, pd.DataFrame] = {}
 
     for tbl in tables:
         try:
-            # Step 1: get column names
-            columns = trino_fetch_table_columns(conn, catalog, schema, tbl)
-            if not columns:
-                continue
-
-            # Step 2: check quality
-            quality = detect_column_quality_per_table(columns)
-
-            if quality == "meaningful":
-                # Column names are enough — no need to fetch rows
-                result[tbl] = pd.DataFrame(columns=columns)
-            else:
-                # Need actual values to detect patterns
-                df = trino_fetch_table_sample(conn, catalog, schema, tbl, sample_limit)
+            df = trino_fetch_table_sample(conn, catalog, schema, tbl, sample_limit)
+            if df is not None and len(df.columns) > 0:
                 result[tbl] = df
         except Exception:
-            # If a table fails, skip it rather than crash the whole load
+            # If sample fetch fails, fall back to column-names-only
             try:
                 columns = trino_fetch_table_columns(conn, catalog, schema, tbl)
                 if columns:
@@ -604,9 +592,13 @@ def cluster_embeddings(embeddings: "np.ndarray", min_cluster_size: int = 5) -> "
 
     n = len(embeddings)
     # UMAP: reduce to 10d for clustering quality, cap neighbors sensibly
-    n_neighbors = max(5, min(15, n // 10))
+    n_components = min(10, max(2, n - 2))
+    n_neighbors = max(2, min(15, n // 10))
+    # UMAP requires n_neighbors < n_samples
+    n_neighbors = min(n_neighbors, n - 1)
+
     reducer = umap.UMAP(
-        n_components=min(10, n - 2),
+        n_components=n_components,
         n_neighbors=n_neighbors,
         min_dist=0.0,
         metric="cosine",
@@ -614,9 +606,13 @@ def cluster_embeddings(embeddings: "np.ndarray", min_cluster_size: int = 5) -> "
     )
     reduced = reducer.fit_transform(embeddings)
 
+    # HDBSCAN: clamp params so they don't exceed n
+    effective_min_cluster = min(min_cluster_size, n)
+    effective_min_samples = min(3, n)
+
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=3,
+        min_cluster_size=effective_min_cluster,
+        min_samples=effective_min_samples,
         metric="euclidean",
         cluster_selection_method="eom",
     )
@@ -657,24 +653,279 @@ def label_cluster_gemini(
     return data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 
+# ---------------------------------------------------------------------------
+# Reference business domain taxonomy for small-N / per-table matching
+# ---------------------------------------------------------------------------
+REFERENCE_DOMAINS = [
+    "Customer",
+    "Order Management",
+    "Sales",
+    "Product Catalog",
+    "Inventory",
+    "Finance",
+    "Accounting",
+    "Billing",
+    "Payments",
+    "Invoice",
+    "HR",
+    "Employee",
+    "Payroll",
+    "Marketing",
+    "Campaign",
+    "Supply Chain",
+    "Logistics",
+    "Shipping",
+    "Manufacturing",
+    "Procurement",
+    "Vendor",
+    "Supplier",
+    "CRM",
+    "Support",
+    "Ticketing",
+    "User",
+    "Authentication",
+    "Access Control",
+    "Telemetry",
+    "Logging",
+    "Analytics",
+    "Reporting",
+    "Healthcare",
+    "Patient",
+    "Insurance",
+    "Claims",
+    "Policy",
+    "Compliance",
+    "Audit",
+    "Risk",
+    "Loan",
+    "Banking",
+    "Trading",
+    "Portfolio",
+    "Real Estate",
+    "Property",
+    "Education",
+    "Student",
+    "Course",
+    "Content Management",
+    "Media",
+    "Asset Management",
+    "Project Management",
+    "Task",
+    "Scheduling",
+    "Calendar",
+    "Communication",
+    "Messaging",
+    "Notification",
+    "Subscription",
+    "Pricing",
+    "Discount",
+    "Tax",
+    "Geography",
+    "Location",
+    "Store",
+    "Retail",
+    "Point of Sale",
+    "Reservation",
+    "Booking",
+    "Travel",
+    "Flight",
+    "Hotel",
+    "Vehicle",
+    "Fleet",
+    "Maintenance",
+    "Quality",
+    "Survey",
+    "Feedback",
+    "Review",
+    "Loyalty",
+    "Rewards",
+    "Warehouse",
+    "Configuration",
+    "Settings",
+    "Reference Data",
+    "Master Data",
+    "Metadata",
+]
+
+
+def _label_single_table_gemini(table_name: str, table_text: str, api_key: str) -> str:
+    """Ask Gemini to label a single table's business domain."""
+    import urllib.request
+
+    prompt = (
+        "You are a data architect. Given this database table and its column context, "
+        "determine its business domain.\n"
+        f"- {table_name}: {table_text[:200]}\n\n"
+        "Respond with a single concise business domain label (1-3 words, title-cased). "
+        "Examples: Customer, Order Management, Finance, Telemetry, HR, Product Catalog. "
+        "Return ONLY the label, nothing else."
+    )
+
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 16},
+    }).encode()
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read())
+    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
+@st.cache_data(show_spinner=False)
+def _get_reference_domain_embeddings():
+    """Embed the reference domain taxonomy once and cache it."""
+    model = load_model()
+    domain_prompts = [f"{d} department business data tables columns records" for d in REFERENCE_DOMAINS]
+    vecs = model.encode(domain_prompts, show_progress_bar=False)
+    return REFERENCE_DOMAINS, vecs
+
+
+def _tag_tables_small_n(
+    table_texts: dict[str, str],
+    table_col_analysis: dict[str, dict],
+    table_columns: dict[str, list[str]],
+    gemini_api_key: str = "",
+    confidence_threshold: float = 0.25,
+) -> dict[str, dict]:
+    """
+    Per-table domain assignment for small table counts where UMAP+HDBSCAN
+    cannot run reliably.
+
+    Strategy:
+      - If Gemini key available → label each table individually via LLM.
+      - Otherwise → match each table against a broad reference taxonomy of
+        ~90 common business domains using cosine similarity. This avoids the
+        circular problem of extracting candidate domains from the same
+        table/column tokens being matched.
+    """
+    import numpy as np
+    from sklearn.metrics.pairwise import cosine_similarity as cos_sim
+
+    model = load_model()
+    table_names = list(table_texts.keys())
+    table_vecs = model.encode(
+        [table_texts[t] for t in table_names],
+        show_progress_bar=False, batch_size=64,
+    )
+
+    # Store vectors in session for future EDA reuse
+    st.session_state["table_embeddings"] = {
+        "names": table_names,
+        "vectors": table_vecs,
+        "cluster_labels": list(range(len(table_names))),
+    }
+
+    results = {}
+
+    if gemini_api_key.strip():
+        # ── Per-table Gemini labelling (best quality) ──
+        for i, tbl in enumerate(table_names):
+            try:
+                domain = _label_single_table_gemini(tbl, table_texts[tbl], gemini_api_key)
+            except Exception:
+                # Fallback to reference taxonomy matching for this table
+                ref_domains, ref_vecs = _get_reference_domain_embeddings()
+                sims = cos_sim([table_vecs[i]], ref_vecs)[0]
+                best_idx = int(np.argmax(sims))
+                domain = ref_domains[best_idx]
+
+            # Compute score by matching against reference taxonomy
+            ref_domains, ref_vecs = _get_reference_domain_embeddings()
+            sims = cos_sim([table_vecs[i]], ref_vecs)[0]
+            best_ref_idx = int(np.argmax(sims))
+            best_score = float(sims[best_ref_idx])
+
+            sorted_idxs = np.argsort(sims)[::-1]
+            runner_up_idx = int(sorted_idxs[1]) if len(sorted_idxs) > 1 else best_ref_idx
+            runner_up = ref_domains[runner_up_idx]
+            runner_up_score = float(sims[runner_up_idx])
+
+            results[tbl] = {
+                "domain": domain,
+                "auto_domain": domain,
+                "score": round(best_score, 3),
+                "columns": table_columns.get(tbl, []),
+                "col_analysis": table_col_analysis.get(tbl, {}),
+                "text_used": table_texts[tbl],
+                "cluster_id": i,
+                "runner_up": f"{runner_up} ({runner_up_score:.2f})",
+            }
+    else:
+        # ── No API key: match against reference taxonomy ──
+        ref_domains, ref_vecs = _get_reference_domain_embeddings()
+        sim_matrix = cos_sim(table_vecs, ref_vecs)
+
+        for i, tbl in enumerate(table_names):
+            best_idx = int(np.argmax(sim_matrix[i]))
+            best_score = float(sim_matrix[i][best_idx])
+
+            if best_score >= confidence_threshold:
+                domain = ref_domains[best_idx]
+            else:
+                domain = UNTAGGED_LABEL
+
+            sorted_idxs = np.argsort(sim_matrix[i])[::-1]
+            runner_up_idx = int(sorted_idxs[1]) if len(sorted_idxs) > 1 else best_idx
+            runner_up = ref_domains[runner_up_idx]
+            runner_up_score = float(sim_matrix[i][runner_up_idx])
+
+            results[tbl] = {
+                "domain": domain,
+                "auto_domain": domain,
+                "score": round(best_score, 3),
+                "columns": table_columns.get(tbl, []),
+                "col_analysis": table_col_analysis.get(tbl, {}),
+                "text_used": table_texts[tbl],
+                "cluster_id": best_idx if best_score >= confidence_threshold else -1,
+                "runner_up": f"{runner_up} ({runner_up_score:.2f})",
+            }
+
+    return results
+
+
 def tag_tables(
     table_texts: dict[str, str],
     table_col_analysis: dict[str, dict],
     table_columns: dict[str, list[str]],
-    min_cluster_size: int = 5,
     gemini_api_key: str = "",
 ) -> dict[str, dict]:
     """
-    Full pipeline:
-      1. Embed (sentence-transformer, local, free)
-      2. UMAP + HDBSCAN cluster
-      3. Label each cluster via Gemini Flash (1 call/cluster)
-      4. Build results dict in same schema as before
+    Full pipeline — automatically picks the best strategy based on table count:
+      - Small N (< 20): per-table reference taxonomy matching (always accurate)
+      - Large N (>= 20): UMAP + HDBSCAN clustering + Gemini/token labelling
+    Falls back to per-table matching if HDBSCAN produces mostly noise.
     """
     import numpy as np
 
+    n = len(table_texts)
+
+    # ── Strategy selection ──
+    # UMAP + HDBSCAN only produces meaningful clusters with enough data.
+    # Below 20 tables, per-table reference matching is more reliable.
+    CLUSTERING_THRESHOLD = 20
+    if n < CLUSTERING_THRESHOLD:
+        return _tag_tables_small_n(
+            table_texts, table_col_analysis, table_columns, gemini_api_key,
+        )
+
+    # ── Large-N: cluster-based pipeline ──
+    # Auto-compute min_cluster_size: ~5% of tables, clamped to [3, 25]
+    min_cluster_size = max(3, min(25, n // 20))
+
     table_names, embeddings = embed_tables(table_texts)
     cluster_labels = cluster_embeddings(embeddings, min_cluster_size)
+
+    # If HDBSCAN assigned most tables to noise, clustering failed — fall back.
+    n_noise = int((cluster_labels == -1).sum())
+    if n_noise >= n * 0.8:
+        return _tag_tables_small_n(
+            table_texts, table_col_analysis, table_columns, gemini_api_key,
+        )
 
     # Store vectors in session for future EDA reuse
     st.session_state["table_embeddings"] = {
@@ -1295,13 +1546,12 @@ def main():
                                     conn, catalog, schema, selected_tables, sample_limit
                                 )
                             if loaded:
-                                meaningful_count = sum(1 for df in loaded.values() if len(df) == 0)
-                                anon_count = len(loaded) - meaningful_count
+                                total_rows = sum(len(df) for df in loaded.values())
+                                total_cols = sum(len(df.columns) for df in loaded.values())
                                 st.session_state["trino_loaded_tables"] = loaded
                                 st.success(
-                                    f"Loaded {len(loaded)} tables — "
-                                    f"{meaningful_count} used column names only, "
-                                    f"{anon_count} fetched row samples."
+                                    f"Loaded {len(loaded)} table{'s' if len(loaded) != 1 else ''} — "
+                                    f"{total_rows:,} sample rows, {total_cols} columns."
                                 )
                             else:
                                 st.error("No tables loaded — check permissions or table names.")
@@ -1462,22 +1712,14 @@ def main():
 
     else:
         # ── Auto-discover config ──
-        cfg_c1, cfg_c2 = st.columns(2)
-        with cfg_c1:
-            min_cluster_size = st.slider(
-                "Min cluster size",
-                min_value=2, max_value=30, value=5, step=1,
-                help="Minimum tables per cluster. Smaller = more clusters. Tables that don't fit any cluster go to Untagged.",
-            )
-        with cfg_c2:
-            gemini_api_key = st.text_input(
-                "Gemini API key (for cluster labelling)",
-                type="password",
-                placeholder="AIza...",
-                help="Optional — without a key, labels fall back to table name tokens. 1 API call per cluster, very cheap.",
-            )
+        gemini_api_key = st.text_input(
+            "Gemini API key (for cluster labelling)",
+            type="password",
+            placeholder="AIza...",
+            help="Optional — without a key, domains are matched from a built-in taxonomy. With a key, Gemini labels each cluster (1 cheap call per cluster).",
+        )
         if not gemini_api_key.strip():
-            st.caption("No API key — cluster labels will be inferred from table name tokens.")
+            st.caption("No API key — tables will be matched against a built-in business domain taxonomy.")
 
         confidence_threshold = DEFAULT_CONFIDENCE_THRESHOLD
 
@@ -1523,7 +1765,7 @@ def main():
             with st.spinner(f"Embedding {len(table_texts)} tables, clustering, and labelling…"):
                 results = tag_tables(
                     table_texts, table_col_analysis,
-                    table_columns, min_cluster_size,
+                    table_columns,
                     gemini_api_key,
                 )
 
